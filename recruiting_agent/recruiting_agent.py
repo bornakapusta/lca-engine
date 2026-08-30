@@ -15,6 +15,7 @@ Install:
 """
 
 import json
+import math
 import os
 import random
 import uuid
@@ -93,13 +94,17 @@ def build_candidate_profile(candidate_id: str) -> dict:
 
 
 SCORING_PROMPT = (
-    "You are a recruiting assistant. Score the candidate against the job from "
-    "1 to 100 based on how good a fit they are, weighing their experience and "
-    "skills. In your justification, explicitly list which of the job's required "
-    "skills the candidate has and which required skills they are missing, naming "
-    "each one. Any missing required skill must lower the skills_match component and "
-    "the overall score. Return a score and a justification that reflects your "
-    "overall assessment of this candidate's fit."
+    "You are a recruiting assistant. Score the candidate against the job using "
+    "only this rubric: experience is scored out of 30, skills_match is scored out "
+    "of 40, and seniority_fit is scored out of 30. Each component must be within "
+    "its stated range, and the three component values must sum to the overall "
+    "score, which is out of 100. No other scale is allowed. Any missing required "
+    "skill must lower the skills_match component and the overall score. In your "
+    "justification, explicitly list which of the job's required skills the "
+    "candidate has and which required skills they are missing, naming each one. "
+    "Do not state rubric values or denominators in the justification. Return a "
+    "score and a justification that reflects your overall assessment of this "
+    "candidate's fit."
 )
 
 from typing import Literal
@@ -108,7 +113,9 @@ class RubricBreakdown(BaseModel):
     experience: float
     skills_match: float
     seniority_fit: float
-    component_max: Literal[100] = 100
+    experience_max: Literal[30] = 30
+    skills_match_max: Literal[40] = 40
+    seniority_fit_max: Literal[30] = 30
 
 
 class CandidateScore(BaseModel):
@@ -127,6 +134,35 @@ def _job_has_required_fields(job):
         job.get("min_years_experience") is not None and bool(job.get("description"))
 
 
+def _valid_candidate_score(result: CandidateScore) -> bool:
+    "Return whether a candidate score satisfies the fixed rubric contract."
+    values = (
+        result.score,
+        result.rubric_breakdown.experience,
+        result.rubric_breakdown.skills_match,
+        result.rubric_breakdown.seniority_fit,
+    )
+    if not all(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        for value in values
+    ):
+        return False
+    breakdown = result.rubric_breakdown
+    return (
+        0 <= breakdown.experience <= 30
+        and 0 <= breakdown.skills_match <= 40
+        and 0 <= breakdown.seniority_fit <= 30
+        and abs(
+            breakdown.experience
+            + breakdown.skills_match
+            + breakdown.seniority_fit
+            - result.score
+        ) <= 0.01
+    )
+
+
 @tool
 def score_candidate(candidate_profile: dict, job_description: dict | None = None) -> dict:
     "Score a candidate profile against a job description on a 1-100 scale with a justification."
@@ -140,11 +176,25 @@ def score_candidate(candidate_profile: dict, job_description: dict | None = None
         "Job description:\n" + json.dumps(job_description, indent=2) +
         "\n\nCandidate profile:\n" + json.dumps(candidate_profile, indent=2)
     )
-    result = _scoring_llm.invoke([
+    messages = [
         {"role": "system", "content": SCORING_PROMPT},
         {"role": "user", "content": user},
-    ])
-    return result.model_dump()
+    ]
+    result = _scoring_llm.invoke(messages)
+    if not _valid_candidate_score(result):
+        result = _scoring_llm.invoke(messages)
+    if not _valid_candidate_score(result):
+        return {"score": None, "error": "Scoring model returned an invalid rubric breakdown."}
+    payload = result.model_dump()
+    payload["max_score"] = 100
+    payload["rubric_breakdown"].update(
+        {
+            "experience_max": 30,
+            "skills_match_max": 40,
+            "seniority_fit_max": 30,
+        }
+    )
+    return payload
 
 
 @tool
@@ -227,7 +277,10 @@ SYSTEM_PROMPT = (
     "candidate record returned by get_candidate, including candidate_id, to "
     "send_candidate_email. Only set confirm_rejected to true after the recruiter "
     "explicitly confirms the send. Always mention the rejected status in the final "
-    "reply, including after a confirmed send."
+    "reply, including after a confirmed send. When reporting a candidate score, use "
+    "only the maximum returned for that component by score_candidate; never invent, "
+    "infer, or rescale denominators, and never describe a component as maxed out "
+    "unless its value equals the returned maximum."
 )
 
 agent_model = ChatOpenAI(model=MODEL_NAME, temperature=0)
